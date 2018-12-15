@@ -99,7 +99,7 @@ class BertServer(threading.Thread):
 
     def run(self):
         # make sure decorate is applied in the same thread/process of of run()
-        return self._run()
+        self._run()
 
     @zmqd.socket(zmq.PULL)
     @zmqd.socket(zmq.PAIR)
@@ -208,7 +208,7 @@ class BertSink(Process):
 
     def run(self):
         # make sure decorate is applied in the same thread/process of of run()
-        return self._run()
+        self._run()
 
     @zmqd.socket(zmq.PULL)
     @zmqd.socket(zmq.PAIR)
@@ -329,7 +329,7 @@ class BertWorker(Process):
 
     def run(self):
         # make sure decorate is applied in the same thread/process of of run()
-        return self._run()
+        self._run()
 
     @zmqd.socket(zmq.PULL)
     @zmqd.socket(zmq.PUSH)
