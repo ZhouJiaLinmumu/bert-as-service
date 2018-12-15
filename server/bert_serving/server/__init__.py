@@ -115,10 +115,6 @@ class BertServer(threading.Thread):
         proc_sink.start()
         self.processes.append(proc_sink)
 
-        # get sink address
-        addr_sink = sink.recv().decode('ascii')
-
-        num_req = 0
         run_on_gpu = False
         device_map = [-1] * self.num_worker
         if not self.args.cpu:
@@ -142,15 +138,20 @@ class BertServer(threading.Thread):
             'worker %2d -> %s' % (w_id, ('gpu %2d' % g_id) if g_id >= 0 else 'cpu') for w_id, g_id in
             enumerate(device_map)))
 
+        # get sink address
+        addr_sink = sink.recv().decode('ascii')
+
         # start the backend processes
         for idx, device_id in enumerate(device_map):
             process = BertWorker(idx, self.args, addr_backend, addr_sink, device_id, self.graph_path)
             self.processes.append(process)
             process.start()
 
+        num_req = 0
         while True:
             try:
                 request = frontend.recv_multipart()
+                num_req += 1
                 client, msg, req_id = request
                 if msg == ServerCommand.show_config:
                     self.logger.info('new config request\treq id: %d\tclient: %s' % (int(req_id), client))
@@ -168,7 +169,6 @@ class BertServer(threading.Thread):
                     continue
 
                 self.logger.info('new encode request\treq id: %d\tclient: %s' % (int(req_id), client))
-                num_req += 1
                 seqs = jsonapi.loads(msg)
                 num_seqs = len(seqs)
                 # register a new job at sink
