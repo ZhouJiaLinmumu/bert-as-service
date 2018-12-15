@@ -14,6 +14,7 @@ from multiprocessing.pool import Pool
 
 import numpy as np
 import zmq
+import zmq.decorators as zmqd
 from termcolor import colored
 from zmq.utils import jsonapi
 
@@ -84,26 +85,6 @@ class BertServer(threading.Thread):
             'use_xla_compiler': args.xla,
         }
         self.processes = []
-        self.context = zmq.Context()
-
-        # frontend facing client
-        self.frontend = self.context.socket(zmq.PULL)
-        self.frontend.bind('tcp://*:%d' % self.port)
-
-        # pair connection between frontend and sink
-        self.sink = self.context.socket(zmq.PAIR)
-        self.addr_front2sink = _auto_bind(self.sink)
-
-        # backend facing workers
-        self.backend = self.context.socket(zmq.PUSH)
-        self.addr_backend = _auto_bind(self.backend)
-
-        # start the sink thread
-        proc_sink = BertSink(self.args, self.addr_front2sink)
-        proc_sink.start()
-        self.processes.append(proc_sink)
-        self.addr_sink = self.sink.recv().decode('ascii')
-
         self.logger.info('freezing, optimizing and exporting graph, could take a while...')
         with Pool(processes=1) as pool:
             # optimize the graph, must be done in another process
@@ -114,13 +95,29 @@ class BertServer(threading.Thread):
         self.logger.info('shutting down...')
         for p in self.processes:
             p.close()
-        self.frontend.close()
-        self.backend.close()
-        self.sink.close()
-        self.context.term()
         self.logger.info('terminated!')
 
     def run(self):
+        # make sure decorate is applied in the same thread/process of of run()
+        return self._run()
+
+    @zmqd.socket(zmq.PULL)
+    @zmqd.socket(zmq.PAIR)
+    @zmqd.socket(zmq.PUSH)
+    def _run(self, frontend, sink, backend):
+        # bind all sockets
+        frontend.bind('tcp://*:%d' % self.port)
+        addr_front2sink = _auto_bind(sink)
+        addr_backend = _auto_bind(backend)
+
+        # start the sink process
+        proc_sink = BertSink(self.args, addr_front2sink)
+        proc_sink.start()
+        self.processes.append(proc_sink)
+
+        # get sink address
+        addr_sink = sink.recv().decode('ascii')
+
         num_req = 0
         run_on_gpu = False
         device_map = [-1] * self.num_worker
@@ -147,27 +144,27 @@ class BertServer(threading.Thread):
 
         # start the backend processes
         for idx, device_id in enumerate(device_map):
-            process = BertWorker(idx, self.args, self.addr_backend, self.addr_sink, device_id, self.graph_path)
+            process = BertWorker(idx, self.args, addr_backend, addr_sink, device_id, self.graph_path)
             self.processes.append(process)
             process.start()
 
         while True:
             try:
-                request = self.frontend.recv_multipart()
+                request = frontend.recv_multipart()
                 client, msg, req_id = request
                 if msg == ServerCommand.show_config:
                     self.logger.info('new config request\treq id: %d\tclient: %s' % (int(req_id), client))
-                    self.sink.send_multipart([client, msg,
-                                              jsonapi.dumps({**{'client': client.decode('ascii'),
-                                                                'num_subprocess': len(self.processes),
-                                                                'ventilator -> worker': self.addr_backend,
-                                                                'worker -> sink': self.addr_sink,
-                                                                'ventilator <-> sink': self.addr_front2sink,
-                                                                'server_current_time': str(datetime.now()),
-                                                                'num_request': num_req,
-                                                                'run_on_gpu': run_on_gpu,
-                                                                'server_version': __version__},
-                                                             **self.args_dict}), req_id])
+                    sink.send_multipart([client, msg,
+                                         jsonapi.dumps({**{'client': client.decode('ascii'),
+                                                           'num_subprocess': len(self.processes),
+                                                           'ventilator -> worker': addr_backend,
+                                                           'worker -> sink': addr_sink,
+                                                           'ventilator <-> sink': addr_front2sink,
+                                                           'server_current_time': str(datetime.now()),
+                                                           'num_request': num_req,
+                                                           'run_on_gpu': run_on_gpu,
+                                                           'server_version': __version__},
+                                                        **self.args_dict}), req_id])
                     continue
 
                 self.logger.info('new encode request\treq id: %d\tclient: %s' % (int(req_id), client))
@@ -175,7 +172,7 @@ class BertServer(threading.Thread):
                 seqs = jsonapi.loads(msg)
                 num_seqs = len(seqs)
                 # register a new job at sink
-                self.sink.send_multipart([client, ServerCommand.new_job, b'%d' % num_seqs, req_id])
+                sink.send_multipart([client, ServerCommand.new_job, b'%d' % num_seqs, req_id])
 
                 job_id = client + b'#' + req_id
                 if num_seqs > self.max_batch_size:
@@ -185,12 +182,10 @@ class BertServer(threading.Thread):
                         tmp = seqs[s_idx: (s_idx + self.max_batch_size)]
                         if tmp:
                             partial_job_id = job_id + b'@%d' % s_idx
-                            self.backend.send_multipart([partial_job_id, jsonapi.dumps(tmp)])
+                            backend.send_multipart([partial_job_id, jsonapi.dumps(tmp)])
                         s_idx += len(tmp)
                 else:
-                    self.backend.send_multipart([job_id, msg])
-            except zmq.error.ContextTerminated:
-                self.logger.error('context is closed!')
+                    backend.send_multipart([job_id, msg])
             except ValueError:
                 self.logger.error('received a wrongly-formatted request (expected 3 frames, got %d)' % len(request))
                 self.logger.error('\n'.join('field %d: %s' % (idx, k) for idx, k in enumerate(request)))
@@ -212,16 +207,15 @@ class BertSink(Process):
         self.logger.info('terminated!')
 
     def run(self):
-        context = zmq.Context()
-        # receive from workers
-        receiver = context.socket(zmq.PULL)
+        # make sure decorate is applied in the same thread/process of of run()
+        return self._run()
+
+    @zmqd.socket(zmq.PULL)
+    @zmqd.socket(zmq.PAIR)
+    @zmqd.socket(zmq.PUB)
+    def _run(self, receiver, frontend, sender):
         receiver_addr = _auto_bind(receiver)
-
-        frontend = context.socket(zmq.PAIR)
         frontend.connect(self.front_sink_addr)
-
-        # publish to client
-        sender = context.socket(zmq.PUB)
         sender.bind('tcp://*:%d' % self.port)
 
         pending_checksum = defaultdict(int)
@@ -235,51 +229,48 @@ class BertSink(Process):
         # send worker receiver address back to frontend
         frontend.send(receiver_addr.encode('ascii'))
 
-        try:
-            while not self.exit_flag.is_set():
-                socks = dict(poller.poll())
-                if socks.get(receiver) == zmq.POLLIN:
-                    msg = receiver.recv_multipart()
-                    job_id = msg[0]
-                    # parsing the ndarray
-                    arr_info, arr_val = jsonapi.loads(msg[1]), msg[2]
-                    X = np.frombuffer(memoryview(arr_val), dtype=arr_info['dtype'])
-                    X = X.reshape(arr_info['shape'])
-                    job_info = job_id.split(b'@')
-                    job_id = job_info[0]
-                    partial_id = job_info[1] if len(job_info) == 2 else 0
-                    pending_result[job_id].append((X, partial_id))
-                    pending_checksum[job_id] += X.shape[0]
-                    self.logger.info('collect job %s (%d/%d)' % (job_id,
-                                                                 pending_checksum[job_id],
-                                                                 job_checksum[job_id]))
+        while not self.exit_flag.is_set():
+            socks = dict(poller.poll())
+            if socks.get(receiver) == zmq.POLLIN:
+                msg = receiver.recv_multipart()
+                job_id = msg[0]
+                # parsing the ndarray
+                arr_info, arr_val = jsonapi.loads(msg[1]), msg[2]
+                X = np.frombuffer(memoryview(arr_val), dtype=arr_info['dtype'])
+                X = X.reshape(arr_info['shape'])
+                job_info = job_id.split(b'@')
+                job_id = job_info[0]
+                partial_id = job_info[1] if len(job_info) == 2 else 0
+                pending_result[job_id].append((X, partial_id))
+                pending_checksum[job_id] += X.shape[0]
+                self.logger.info('collect job %s (%d/%d)' % (job_id,
+                                                             pending_checksum[job_id],
+                                                             job_checksum[job_id]))
 
-                    # check if there are finished jobs, send it back to workers
-                    finished = [(k, v) for k, v in pending_result.items() if pending_checksum[k] == job_checksum[k]]
-                    for job_info, tmp in finished:
-                        self.logger.info(
-                            'send back\tsize: %d\tjob id:%s\t' % (
-                                job_checksum[job_info], job_info))
-                        # re-sort to the original order
-                        tmp = [x[0] for x in sorted(tmp, key=lambda x: int(x[1]))]
-                        client_addr, req_id = job_info.split(b'#')
-                        send_ndarray(sender, client_addr, np.concatenate(tmp, axis=0), req_id)
-                        pending_result.pop(job_info)
-                        pending_checksum.pop(job_info)
-                        job_checksum.pop(job_info)
+                # check if there are finished jobs, send it back to workers
+                finished = [(k, v) for k, v in pending_result.items() if pending_checksum[k] == job_checksum[k]]
+                for job_info, tmp in finished:
+                    self.logger.info(
+                        'send back\tsize: %d\tjob id:%s\t' % (
+                            job_checksum[job_info], job_info))
+                    # re-sort to the original order
+                    tmp = [x[0] for x in sorted(tmp, key=lambda x: int(x[1]))]
+                    client_addr, req_id = job_info.split(b'#')
+                    send_ndarray(sender, client_addr, np.concatenate(tmp, axis=0), req_id)
+                    pending_result.pop(job_info)
+                    pending_checksum.pop(job_info)
+                    job_checksum.pop(job_info)
 
-                if socks.get(frontend) == zmq.POLLIN:
-                    client_addr, msg_type, msg_info, req_id = frontend.recv_multipart()
-                    if msg_type == ServerCommand.new_job:
-                        job_info = client_addr + b'#' + req_id
-                        job_checksum[job_info] = int(msg_info)
-                        self.logger.info('job register\tsize: %d\tjob id: %s' % (int(msg_info), job_info))
-                    elif msg_type == ServerCommand.show_config:
-                        time.sleep(0.1)  # dirty fix of slow-joiner: sleep so that client receiver can connect.
-                        self.logger.info('send config\tclient %s' % client_addr)
-                        sender.send_multipart([client_addr, msg_info, req_id])
-        except zmq.error.ContextTerminated:
-            self.logger.error('context is closed!')
+            if socks.get(frontend) == zmq.POLLIN:
+                client_addr, msg_type, msg_info, req_id = frontend.recv_multipart()
+                if msg_type == ServerCommand.new_job:
+                    job_info = client_addr + b'#' + req_id
+                    job_checksum[job_info] = int(msg_info)
+                    self.logger.info('job register\tsize: %d\tjob id: %s' % (int(msg_info), job_info))
+                elif msg_type == ServerCommand.show_config:
+                    time.sleep(0.1)  # dirty fix of slow-joiner: sleep so that client receiver can connect.
+                    self.logger.info('send config\tclient %s' % client_addr)
+                    sender.send_multipart([client_addr, msg_info, req_id])
 
 
 class BertWorker(Process):
@@ -337,29 +328,26 @@ class BertWorker(Process):
         return Estimator(model_fn=model_fn, config=RunConfig(session_config=config))
 
     def run(self):
+        # make sure decorate is applied in the same thread/process of of run()
+        return self._run()
+
+    @zmqd.socket(zmq.PULL)
+    @zmqd.socket(zmq.PUSH)
+    def _run(self, receiver, sink):
         self.logger.info('use device %s, load graph from %s' %
                          ('cpu' if self.device_id < 0 else ('gpu: %d' % self.device_id), self.graph_path))
         os.environ['CUDA_VISIBLE_DEVICES'] = str(self.device_id)
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-        self.logger.info('please ignore "WARNING: Using temporary folder as model directory"')
+        self.logger.info('please ignore "WARNING: Using temporary folder as model directory"...')
 
         import tensorflow as tf
         estimator = self.get_estimator(tf)
 
-        context = zmq.Context()
-        receiver = context.socket(zmq.PULL)
         receiver.connect(self.worker_address)
-        sink = context.socket(zmq.PUSH)
         sink.connect(self.sink_address)
-
         for r in estimator.predict(self.input_fn_builder(receiver, tf), yield_single_examples=False):
             send_ndarray(sink, r['client_id'], r['encodes'])
             self.logger.info('job done\tsize: %s\tclient: %s' % (r['encodes'].shape, r['client_id']))
-
-        receiver.close()
-        sink.close()
-        context.term()
-        self.logger.info('terminated!')
 
     def input_fn_builder(self, worker, tf):
         def gen():
