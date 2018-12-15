@@ -97,20 +97,24 @@ class BertServer(threading.Thread):
         self.logger.info('terminated!')
 
     def run(self):
-        with zmq.Context.instance() as ctx, ctx.socket(zmq.PULL) as frontend, ctx.socket(
-                zmq.PAIR) as sink, ctx.socket(zmq.PUSH) as backend:
+        with zmq.Context.instance() as ctx, \
+                ctx.socket(zmq.PULL) as frontend, \
+                ctx.socket(zmq.PAIR) as sink, \
+                ctx.socket(zmq.PUSH) as backend:
             # bind all sockets
+            self.logger.info('bind all sockets')
             frontend.bind('tcp://*:%d' % self.port)
             addr_front2sink = _auto_bind(sink)
             addr_backend = _auto_bind(backend)
-            self.logger.info('bind all sockets')
 
             # start the sink process
+            self.logger.info('start the sink')
             proc_sink = BertSink(self.args, addr_front2sink)
             self.processes.append(proc_sink)
             proc_sink.start()
-            self.logger.info('start the sink')
+            addr_sink = sink.recv().decode('ascii')
 
+            self.logger.info('get devices')
             run_on_gpu = False
             device_map = [-1] * self.num_worker
             if not self.args.cpu:
@@ -130,12 +134,9 @@ class BertServer(threading.Thread):
                     self.logger.warn('nvidia-smi is missing, often means no gpu on this machine. '
                                      'fall back to cpu!')
 
-            self.logger.info('device_map: \n\t\t%s' % '\n\t\t'.join(
+            self.logger.info('device map: \n\t\t%s' % '\n\t\t'.join(
                 'worker %2d -> %s' % (w_id, ('gpu %2d' % g_id) if g_id >= 0 else 'cpu') for w_id, g_id in
                 enumerate(device_map)))
-
-            # get sink address
-            addr_sink = sink.recv().decode('ascii')
 
             # start the backend processes
             for idx, device_id in enumerate(device_map):
@@ -203,8 +204,10 @@ class BertSink(Process):
         self.logger.info('terminated!')
 
     def run(self):
-        with zmq.Context.instance() as ctx, ctx.socket(zmq.PULL) as receiver, ctx.socket(
-                zmq.PAIR) as frontend, ctx.socket(zmq.PUB) as sender:
+        with zmq.Context.instance() as ctx, \
+                ctx.socket(zmq.PULL) as receiver, \
+                ctx.socket(zmq.PAIR) as frontend, \
+                ctx.socket(zmq.PUB) as sender:
 
             receiver_addr = _auto_bind(receiver)
             frontend.connect(self.front_sink_addr)
@@ -221,7 +224,7 @@ class BertSink(Process):
             # send worker receiver address back to frontend
             frontend.send(receiver_addr.encode('ascii'))
 
-            self.logger.info('ready')
+            self.logger.info('ready: %s' % receiver_addr)
             while not self.exit_flag.is_set():
                 socks = dict(poller.poll())
                 if socks.get(receiver) == zmq.POLLIN:
