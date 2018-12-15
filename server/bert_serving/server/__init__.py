@@ -97,14 +97,14 @@ class BertServer(threading.Thread):
             p.close()
         self.logger.info('terminated!')
 
-    def run(self):
-        # make sure decorate is applied in the same thread/process of of run()
-        self._run()
+    # def run(self):
+    #     # make sure decorate is applied in the same thread/process of of run()
+    #     self._run()
 
     @zmqd.socket(zmq.PULL)
     @zmqd.socket(zmq.PAIR)
     @zmqd.socket(zmq.PUSH)
-    def _run(self, frontend, sink, backend):
+    def run(self, frontend, sink, backend):
         # bind all sockets
         frontend.bind('tcp://*:%d' % self.port)
         addr_front2sink = _auto_bind(sink)
