@@ -109,11 +109,13 @@ class BertServer(threading.Thread):
         frontend.bind('tcp://*:%d' % self.port)
         addr_front2sink = _auto_bind(sink)
         addr_backend = _auto_bind(backend)
+        self.logger.info('bind all sockets')
 
         # start the sink process
         proc_sink = BertSink(self.args, addr_front2sink)
-        proc_sink.start()
         self.processes.append(proc_sink)
+        proc_sink.start()
+        self.logger.info('start the sink')
 
         run_on_gpu = False
         device_map = [-1] * self.num_worker
@@ -229,6 +231,7 @@ class BertSink(Process):
         # send worker receiver address back to frontend
         frontend.send(receiver_addr.encode('ascii'))
 
+        self.logger.info('ready')
         while not self.exit_flag.is_set():
             socks = dict(poller.poll())
             if socks.get(receiver) == zmq.POLLIN:
