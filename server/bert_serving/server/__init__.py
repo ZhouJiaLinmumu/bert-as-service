@@ -221,10 +221,12 @@ class BertSink(Process):
             poller.register(frontend, zmq.POLLIN)
             poller.register(receiver, zmq.POLLIN)
 
-            # send worker receiver address back to frontend
-            frontend.send(receiver_addr.encode('ascii'))
+            for _ in range(10):
+                # send worker receiver address back to frontend
+                frontend.send(receiver_addr.encode('ascii'))
+                time.sleep(1)
+                self.logger.info('inform frontend, ready at %s' % receiver_addr)
 
-            self.logger.info('ready: %s' % receiver_addr)
             while not self.exit_flag.is_set():
                 socks = dict(poller.poll())
                 if socks.get(receiver) == zmq.POLLIN:
