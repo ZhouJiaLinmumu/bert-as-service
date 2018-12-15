@@ -208,14 +208,10 @@ class BertSink(Process):
         self.join()
         self.logger.info('terminated!')
 
-    def run(self):
-        # make sure decorate is applied in the same thread/process of of run()
-        self._run()
-
     @zmqd.socket(zmq.PULL)
     @zmqd.socket(zmq.PAIR)
     @zmqd.socket(zmq.PUB)
-    def _run(self, receiver, frontend, sender):
+    def run(self, receiver, frontend, sender):
         receiver_addr = _auto_bind(receiver)
         frontend.connect(self.front_sink_addr)
         sender.bind('tcp://*:%d' % self.port)
@@ -330,13 +326,9 @@ class BertWorker(Process):
 
         return Estimator(model_fn=model_fn, config=RunConfig(session_config=config))
 
-    def run(self):
-        # make sure decorate is applied in the same thread/process of of run()
-        self._run()
-
     @zmqd.socket(zmq.PULL)
     @zmqd.socket(zmq.PUSH)
-    def _run(self, receiver, sink):
+    def run(self, receiver, sink):
         self.logger.info('use device %s, load graph from %s' %
                          ('cpu' if self.device_id < 0 else ('gpu: %d' % self.device_id), self.graph_path))
         os.environ['CUDA_VISIBLE_DEVICES'] = str(self.device_id)
